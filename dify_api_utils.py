@@ -4,9 +4,6 @@ import os
 from enum import Enum
 
 
-dify_url = "http://10.144.129.132/v1"
-
-
 class DifyAPIError(Exception):
     """自定义异常类用于处理 Dify API 错误"""
     pass
@@ -18,16 +15,34 @@ class ResponseMode(Enum):
     
 
 def dify_api_error_handler(response):
+    """处理API错误响应"""
     if response.status_code != 200:
-            try:
-                error_info = response.json()
-                error_code = error_info.get('code', 'unknown_error')
-                error_message = error_info.get('message', '未知错误')
-            except ValueError:
-                error_code = 'unknown_error'
-                error_message = response.text or '未知错误'
-            raise DifyAPIError(f"发送聊天消息失败: {error_code} - {error_message}")
-        
+        try:
+            error_info = response.json()
+            error_code = error_info.get('code', 'unknown_error')
+            error_message = error_info.get('message', '未知错误')
+        except ValueError:
+            error_code = 'unknown_error'
+            error_message = response.text or '未知错误'
+        raise DifyAPIError(f"发送聊天消息失败: {error_code} - {error_message}")
+
+
+def create_headers(api_key: str, include_content_type: bool = False) -> dict:
+    """
+    创建请求头
+    
+    参数:
+        api_key (str): API密钥
+        include_content_type (bool): 是否包含Content-Type头
+    """
+    headers = {
+        'Authorization': f'Bearer {api_key}'
+    }
+    if include_content_type:
+        headers['Content-Type'] = 'application/json'
+    return headers
+
+
 def upload_files(api_base_url: str, headers: dict, files: list[str], user: str) -> list[str]:
     """
     上传文件到 Dify API 并返回文件 ID 列表
@@ -82,39 +97,23 @@ def upload_files(api_base_url: str, headers: dict, files: list[str], user: str) 
     return uploaded_file_ids
 
 
-def call_dify_api(api_key:str, query:str, response_mode:ResponseMode, user:str, files:list[str]=None, conversation_id:str=None, 
-                  inputs:dict=None, auto_generate_name:bool=True, api_base_url:str='http://10.144.129.132/v1'):
+def prepare_chat_request(api_key: str, query: str, response_mode: ResponseMode, user: str, 
+                        files: list[str] = None, conversation_id: str = None,
+                        inputs: dict = None, auto_generate_name: bool = True, 
+                        api_base_url: str = 'http://10.144.129.132/v1') -> tuple:
     """
-    调用 Dify API 以上传文件并发送聊天消息。
-
-    参数:
-        api_key (str): API 密钥，用于授权。
-        query (str): 用户的查询或消息内容。
-        user (str): 用户标识，用于定义终端用户的身份。
-        files (list of str, optional): 要上传的本地文件路径列表。支持图片格式（png, jpg, jpeg, webp, gif）。
-        conversation_id (str, optional): 会话 ID，用于基于之前的聊天记录继续对话。
-        inputs (dict, optional): 额外的输入参数。
-        auto_generate_name (bool, optional): 是否自动生成标题，默认 True。
-        api_base_url (str, optional): API 的基础 URL，默认 'http://10.144.129.132/v1'。
-
-    返回:
-        dict: /chat-messages API 的响应内容。
-
-    抛出:
-        DifyAPIError: 如果 API 调用失败或返回错误。
+    准备聊天请求所需的headers和payload
     """
-    headers = {
-        'Authorization': f'Bearer {api_key}'
-    }
+    # 上传文件时使用的headers（不包含Content-Type）
+    upload_headers = create_headers(api_key)
+    
+    # 处理文件上传
+    uploaded_file_ids = upload_files(api_base_url, upload_headers, files or [], user) if files else []
 
-    uploaded_file_ids = []
+    # 聊天请求使用的headers（包含Content-Type）
+    chat_headers = create_headers(api_key, include_content_type=True)
 
-    # 文件上传部分
-    if files:
-        uploaded_file_ids = upload_files(api_base_url, headers, files or [], user)
-
-    # 构建 /chat-messages 请求体
-    chat_messages_url = f'{api_base_url}/chat-messages'
+    # 构建请求payload
     payload = {
         'query': query,
         'response_mode': response_mode.value,
@@ -128,59 +127,101 @@ def call_dify_api(api_key:str, query:str, response_mode:ResponseMode, user:str, 
             'upload_file_id': file_id
         } for file_id in uploaded_file_ids] if uploaded_file_ids else []
     }
-        
-    headers['Content-Type'] = 'application/json'
+    
+    chat_messages_url = f'{api_base_url}/chat-messages'
+    return chat_headers, payload, chat_messages_url
+
+
+def handle_blocking_response(headers: dict, payload: dict, chat_messages_url: str) -> str:
+    """
+    处理阻塞模式的响应
+    """
+    response = requests.post(chat_messages_url, headers=headers, json=payload)
+    dify_api_error_handler(response)
+    return response.json()['answer']
+
+
+def handle_streaming_response(headers: dict, payload: dict, chat_messages_url: str) -> str:
+    """
+    处理流式响应
+    """
+    response = requests.post(chat_messages_url, headers=headers, json=payload, stream=True)
+    dify_api_error_handler(response)
+    
+    answer_list = []
+    buffer = ""
+    
+    for chunk in response.iter_content(chunk_size=32):
+        if chunk:
+            buffer += chunk.decode('utf-8')
+            
+            while '\n' in buffer:
+                line, buffer = buffer.split('\n', 1)
+                line = line.strip()
+                
+                if not line:
+                    continue
+                    
+                if line.startswith('data: '):
+                    line = line[6:]
+                    
+                try:
+                    data = json.loads(line)
+                    if data['event'] == 'message' and 'answer' in data:
+                        print(data['answer'], end='', flush=True)
+                        answer_list.append(data['answer'])
+                except json.JSONDecodeError:
+                    continue
+    
+    return ''.join(answer_list)
+
+
+def call_dify_api(api_key: str, query: str, response_mode: ResponseMode, user: str, 
+                  files: list[str] = None, conversation_id: str = None,
+                  inputs: dict = None, auto_generate_name: bool = True, 
+                  api_base_url: str = 'http://10.144.129.132/v1') -> str:
+    """
+    调用 Dify API 的主函数
+    
+    参数:
+        api_key (str): API 密钥，用于授权
+        query (str): 用户的查询或消息内容
+        response_mode (ResponseMode): 响应模式（STREAMING 或 BLOCKING）
+        user (str): 用户标识
+        files (list[str], optional): 要上传的本地文件路径列表
+        conversation_id (str, optional): 会话ID
+        inputs (dict, optional): 额外的输入参数
+        auto_generate_name (bool, optional): 是否自动生成标题
+        api_base_url (str, optional): API的基础URL
+
+    返回:
+        str: API的响应内容
+    """
+    headers, payload, chat_messages_url = prepare_chat_request(
+        api_key, query, response_mode, user, files, 
+        conversation_id, inputs, auto_generate_name, api_base_url
+    )
 
     if response_mode == ResponseMode.BLOCKING:
-        response = requests.post(chat_messages_url, headers=headers, json=payload)
-        dify_api_error_handler(response)
-        return response.json()['answer']
+        return handle_blocking_response(headers, payload, chat_messages_url)
     elif response_mode == ResponseMode.STREAMING:
-        response = requests.post(chat_messages_url, headers=headers, json=payload, stream=True)
-        dify_api_error_handler(response)
-        
-        answer_list = []
-        buffer = ""
-        
-        for chunk in response.iter_content(chunk_size=32):
-            if chunk:
-                # 将字节转换为字符串并添加到缓冲区
-                buffer += chunk.decode('utf-8')
-                
-                # 检查缓冲区中是否有完整的数据行
-                while '\n' in buffer:
-                    line, buffer = buffer.split('\n', 1)
-                    line = line.strip()
-                    
-                    # 跳过空行
-                    if not line:
-                        continue
-                        
-                    # 移除 "data: " 前缀
-                    if line.startswith('data: '):
-                        line = line[6:]
-                        
-                    try:
-                        data = json.loads(line)
-                        if data['event'] == 'message':
-                            if 'answer' in data:
-                                print(data['answer'], end='', flush=True)
-                                answer_list.append(data['answer'])
-                    except json.JSONDecodeError:
-                        continue
-        
-        return ''.join(answer_list)
+        return handle_streaming_response(headers, payload, chat_messages_url)
     else:
         raise DifyAPIError(f"不支持的响应模式: {response_mode}")
-        
-
-
 
 
 if __name__ == "__main__":
     files=["/home/lius/图片/必应-加龙河上的历史通道-SergiyN-Getty Images.jpg"]
-    query = "你是一个中文ai助手。请以图片中的内容为素材，写一首抒情诗。"
-    #print(call_dify_api(api_key="app-KAQhWhzyPsBZmlpb0qcyzJcM", query="你是一个中文ai助手，请以问八百标兵奔北坡为标题，写一首抒情诗。", response_mode=ResponseMode.STREAMING, user="lius", files=[]))
-    print(call_dify_api(api_key="app-KAQhWhzyPsBZmlpb0qcyzJcM", query=query, 
-                        response_mode=ResponseMode.STREAMING, user="lius", files=files))
+    query = "你是一个中文ai助手。请以图片中的内容为素材，写一首抒情七言律诗。"
+    call_dify_api(
+        api_key="app-KAQhWhzyPsBZmlpb0qcyzJcM",
+        query=query, 
+        response_mode=ResponseMode.STREAMING,
+        user="lius",
+        files=files
+    )
+    
+    print("-------------------------------------")
+    
+
     
